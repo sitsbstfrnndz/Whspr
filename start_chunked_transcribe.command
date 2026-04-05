@@ -1,3 +1,3 @@
 #!/bin/zsh
-cd "$HOME/AudioRecorder" || exit 1
-/Users/sbstfrnndz/.pyenv/versions/3.13.7/bin/python chunked_transcribe.py
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+exec /Users/sbstfrnndz/.pyenv/versions/3.13.7/bin/python "$SCRIPT_DIR/chunked_transcribe.py"
