@@ -321,14 +321,11 @@ class RealtimeUI:
         if not AUDIO_LOGS_DIR.exists():
             return None
 
-        # Always rescan so we can switch to newer files created after startup.
+        # Only show files created for the current UI session run.
         selected_latest = self._find_latest_file(
             [self._current_session_pattern()], min_mtime=self.session_anchor_ts
         )
-        selected_any = self._find_latest_file([self._current_session_pattern()])
-        any_latest = self._find_latest_file(["chunked_session_*.txt", "realtime_session_*.txt"])
-
-        candidate = selected_latest or selected_any or any_latest
+        candidate = selected_latest
         if candidate is None:
             return None
 
