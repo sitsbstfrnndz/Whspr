@@ -2,6 +2,7 @@ import os
 import platform
 import signal
 import subprocess
+import sys
 import time
 import tkinter as tk
 from pathlib import Path
@@ -15,33 +16,43 @@ def load_dotenv():
     except Exception:
         return False
 
+
+# Load .env first so module-level config defaults pick up local settings.
+load_dotenv()
+
 AUDIO_LOGS_DIR = Path(os.path.expanduser("~/AudioLogs"))
-START_REALTIME_SCRIPT = Path(os.path.expanduser("~/AudioRecorder/start_realtime_prototype.command"))
-START_CHUNKED_SCRIPT = Path(os.path.expanduser("~/AudioRecorder/start_chunked_transcribe.command"))
+PROJECT_DIR = Path(__file__).resolve().parent
+REALTIME_SCRIPT = PROJECT_DIR / "realtime_prototype.py"
+CHUNKED_SCRIPT = PROJECT_DIR / "chunked_transcribe.py"
 REFRESH_MS = 1200
 MAX_VIEW_CHARS = 8000
 AUTO_START_ON_LAUNCH = os.getenv("AUTO_START_ON_LAUNCH", "1") == "1"
 UI_THEME = os.getenv("UI_THEME", "auto").strip().lower()
 UI_TRANSCRIBE_MODE = os.getenv("UI_TRANSCRIBE_MODE", "realtime").strip().lower()
 WINDOW_TOP_RIGHT = os.getenv("WINDOW_TOP_RIGHT", "1") == "1"
+STOP_FORCE_KILL_MS = int(os.getenv("STOP_FORCE_KILL_MS", "1200"))
+CHUNK_SECONDS_CHUNKED = int(os.getenv("CHUNK_SECONDS_CHUNKED", os.getenv("CHUNK_SECONDS", "10")))
 
 
 class RealtimeUI:
     def __init__(self, root: tk.Tk):
-        # Load OPENAI_API_KEY and related env vars from a local .env if present.
-        load_dotenv()
-
         self.root = root
         self.root.title("Whspr Realtime")
         self.root.geometry("440x320")
         self.root.minsize(400, 260)
 
         self.proc: subprocess.Popen | None = None
+        self.stop_requested = False
         self.status_var = tk.StringVar(value="Idle")
-        initial_mode = "Chunked" if UI_TRANSCRIBE_MODE == "chunked" else "Realtime"
+        if UI_TRANSCRIBE_MODE == "chunked":
+            initial_mode = "Chunked"
+        else:
+            initial_mode = "Realtime"
         self.mode_var = tk.StringVar(value=initial_mode)
         self.session_anchor_ts = time.time()
         self.active_transcript_file: Path | None = None
+        self._last_view_content: str | None = None
+        self.current_chunk_seconds = CHUNK_SECONDS_CHUNKED
 
         self.theme_mode = self._resolve_theme_mode()
         self.colors = self._theme_tokens(self.theme_mode)
@@ -246,7 +257,7 @@ class RealtimeUI:
         return self.proc is not None and self.proc.poll() is None
 
     def _update_toggle_button(self):
-        if self._is_running() or self.status_var.get() in {"Connecting...", "Stopping..."}:
+        if self._is_running() or self.status_var.get() in {"Connecting...", "Starting...", "Stopping..."}:
             self.toggle_btn.configure(text="Stop")
             self.mode_combo.configure(state="disabled")
         else:
@@ -254,13 +265,29 @@ class RealtimeUI:
             self.mode_combo.configure(state="readonly")
 
     def _mode_key(self) -> str:
-        return "chunked" if self.mode_var.get() == "Chunked" else "realtime"
+        mode = self.mode_var.get()
+        if mode == "Chunked":
+            return "chunked"
+        return "realtime"
 
-    def _current_start_script(self) -> Path:
-        return START_CHUNKED_SCRIPT if self._mode_key() == "chunked" else START_REALTIME_SCRIPT
+    def _current_backend_script(self) -> Path:
+        return CHUNKED_SCRIPT if self._mode_key() == "chunked" else REALTIME_SCRIPT
 
     def _current_session_pattern(self) -> str:
         return "chunked_session_*.txt" if self._mode_key() == "chunked" else "realtime_session_*.txt"
+
+    def _kill_chunked_processes(self):
+        # Extra safety: chunked recording can block in audio reads on some systems.
+        # This kills any lingering chunked pipeline processes started from the UI.
+        try:
+            subprocess.run(
+                ["pkill", "-f", "chunked_transcribe.py"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except Exception:
+            pass
 
     def _on_mode_changed(self, _event=None):
         if self._is_running():
@@ -276,48 +303,92 @@ class RealtimeUI:
         self.text.see("end")
         self.text.configure(state="disabled")
 
+    def _find_latest_file(self, patterns: list[str], min_mtime: float | None = None) -> Path | None:
+        candidates: list[Path] = []
+        for pattern in patterns:
+            for p in AUDIO_LOGS_DIR.glob(pattern):
+                try:
+                    if min_mtime is None or p.stat().st_mtime >= min_mtime:
+                        candidates.append(p)
+                except OSError:
+                    continue
+
+        if not candidates:
+            return None
+        return max(candidates, key=lambda p: p.stat().st_mtime)
+
     def latest_session_file(self) -> Path | None:
         if not AUDIO_LOGS_DIR.exists():
             return None
 
-        if self.active_transcript_file and self.active_transcript_file.exists():
-            return self.active_transcript_file
-
-        session_files = sorted(
-            [
-                p
-                for p in AUDIO_LOGS_DIR.glob(self._current_session_pattern())
-                if p.stat().st_mtime >= self.session_anchor_ts
-            ],
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
+        # Always rescan so we can switch to newer files created after startup.
+        selected_latest = self._find_latest_file(
+            [self._current_session_pattern()], min_mtime=self.session_anchor_ts
         )
-        if session_files:
-            self.active_transcript_file = session_files[0]
+        selected_any = self._find_latest_file([self._current_session_pattern()])
+        any_latest = self._find_latest_file(["chunked_session_*.txt", "realtime_session_*.txt"])
+
+        candidate = selected_latest or selected_any or any_latest
+        if candidate is None:
+            return None
+
+        try:
+            candidate_mtime = candidate.stat().st_mtime
+        except OSError:
             return self.active_transcript_file
 
-        return None
+        if self.active_transcript_file is None:
+            self.active_transcript_file = candidate
+            return self.active_transcript_file
+
+        try:
+            active_mtime = self.active_transcript_file.stat().st_mtime
+        except OSError:
+            self.active_transcript_file = candidate
+            return self.active_transcript_file
+
+        if candidate_mtime >= active_mtime:
+            self.active_transcript_file = candidate
+
+        return self.active_transcript_file
 
     def refresh_transcript(self):
         transcript_file = self.latest_session_file()
         if transcript_file is None:
-            self.set_transcript_view("Waiting for transcript...\n")
+            rendered = "Waiting for transcript...\n"
+            if rendered != self._last_view_content:
+                self.set_transcript_view(rendered)
+                self._last_view_content = rendered
             return
 
         try:
             content = transcript_file.read_text(encoding="utf-8")
             if len(content) > MAX_VIEW_CHARS:
                 content = content[-MAX_VIEW_CHARS:]
-            self.set_transcript_view(content if content else "(empty transcript)\n")
+            rendered = content if content else "(empty transcript)\n"
+            if rendered != self._last_view_content:
+                self.set_transcript_view(rendered)
+                self._last_view_content = rendered
         except Exception as exc:
-            self.set_transcript_view(f"Error reading transcript: {exc}\n")
+            rendered = f"Error reading transcript: {exc}\n"
+            if rendered != self._last_view_content:
+                self.set_transcript_view(rendered)
+                self._last_view_content = rendered
 
     def schedule_refresh(self):
-        self.refresh_transcript()
-        self.root.after(REFRESH_MS, self.schedule_refresh)
+        try:
+            self.refresh_transcript()
+        except Exception as exc:
+            # Never let the refresh loop die on transient file/process races.
+            rendered = f"Refresh error: {exc}\n"
+            if rendered != self._last_view_content:
+                self.set_transcript_view(rendered)
+                self._last_view_content = rendered
+        finally:
+            self.root.after(REFRESH_MS, self.schedule_refresh)
 
     def toggle_transcription(self):
-        if self._is_running() or self.status_var.get() == "Connecting...":
+        if self._is_running() or self.status_var.get() in {"Connecting...", "Starting..."}:
             self.stop_transcription()
         else:
             self.start_transcription()
@@ -335,26 +406,42 @@ class RealtimeUI:
             self.set_transcript_view("OPENAI_API_KEY missing in environment or .env\n")
             return
 
-        start_script = self._current_start_script()
-        if not start_script.exists():
-            self._set_status("Error: start script missing")
+        backend_script = self._current_backend_script()
+        if not backend_script.exists():
+            self._set_status("Error: backend script missing")
             return
 
         # Start in a process group so we can stop child processes cleanly.
         # Reset transcript source anchor so each run starts with a fresh UI session view.
+        self.stop_requested = False
         self.session_anchor_ts = time.time()
         self.active_transcript_file = None
         self.set_transcript_view("Waiting for transcript...\n")
 
         if self._mode_key() == "chunked":
             self._set_status("Starting...")
+            self.current_chunk_seconds = CHUNK_SECONDS_CHUNKED
+            self.set_transcript_view(
+                f"Starting chunked transcription...\n"
+                f"Recording first chunk (~{self.current_chunk_seconds}s), then sending to API.\n"
+                "Transcript will appear after the first chunk completes.\n"
+            )
         else:
             self._set_status("Connecting...")
+            self.current_chunk_seconds = 0
+
+        proc_env = os.environ.copy()
+        if self._mode_key() == "chunked":
+            proc_env["OPENAI_TRANSCRIBE_MODEL"] = "gpt-4o-mini-transcribe"
+            proc_env["CHUNK_SECONDS"] = str(CHUNK_SECONDS_CHUNKED)
+
         self.proc = subprocess.Popen(
-            ["bash", str(start_script)],
+            [sys.executable, str(backend_script)],
             preexec_fn=os.setsid,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            env=proc_env,
+            cwd=str(PROJECT_DIR),
         )
         self.root.after(1200, self._verify_backend_started)
 
@@ -364,17 +451,29 @@ class RealtimeUI:
         code = self.proc.poll()
         if code is not None:
             self._set_status(f"Error: backend exited ({code})")
-            script_name = self._current_start_script().name
+            script_name = self._current_backend_script().name
             self.set_transcript_view(
-                f"Backend exited quickly. Run {script_name} in terminal for details.\n"
+                f"Backend exited quickly. Run {script_name} in Terminal for details.\n"
             )
         else:
+            if self.stop_requested:
+                self.stop_transcription()
+                return
             if self._mode_key() == "chunked":
                 self._set_status("Transcribing Chunks")
             else:
                 self._set_status("Connected / Listening")
 
     def stop_transcription(self):
+        if self.status_var.get() in {"Connecting...", "Starting..."}:
+            self.stop_requested = True
+            if self._mode_key() == "chunked":
+                self._kill_chunked_processes()
+            self._set_status("Stopping...")
+            self.root.after(150, self._verify_backend_stopped)
+            self.root.after(STOP_FORCE_KILL_MS, self._force_kill_if_needed)
+            return
+
         if not self._is_running():
             self._set_status("Idle")
             return
@@ -384,9 +483,15 @@ class RealtimeUI:
             if proc is None:
                 self._set_status("Idle")
                 return
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except Exception:
+                proc.terminate()
+            if self._mode_key() == "chunked":
+                self._kill_chunked_processes()
             self._set_status("Stopping...")
             self.root.after(350, self._verify_backend_stopped)
+            self.root.after(STOP_FORCE_KILL_MS, self._force_kill_if_needed)
         except Exception:
             self._set_status("Stop failed")
 
@@ -395,6 +500,24 @@ class RealtimeUI:
             self._set_status("Idle")
         else:
             self.root.after(350, self._verify_backend_stopped)
+
+    def _force_kill_if_needed(self):
+        if self._mode_key() == "chunked":
+            self._kill_chunked_processes()
+        if not self._is_running():
+            return
+        try:
+            proc = self.proc
+            if proc is None:
+                self._set_status("Idle")
+                return
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                proc.kill()
+            self._set_status("Idle")
+        except Exception:
+            self._set_status("Stop failed")
 
     def on_close(self):
         self.stop_transcription()

@@ -26,8 +26,6 @@ CHUNK_SECONDS = int(os.getenv("CHUNK_SECONDS", "4"))
 SAMPLE_RATE = int(os.getenv("CHUNK_SAMPLE_RATE", "16000"))
 CHANNELS = 1
 SAVE_CHUNKS = os.getenv("SAVE_CHUNKS", "0") == "1"
-DIARIZATION_ENABLED = os.getenv("DIARIZATION", "0") == "1"
-DIARIZATION_SPEAKERS = max(1, int(os.getenv("DIARIZATION_SPEAKERS", "2")))
 
 LOG_DIR = Path(os.path.expanduser(os.getenv("TRANSCRIPT_DIR", "~/AudioLogs")))
 
@@ -45,11 +43,22 @@ def ensure_dirs():
 
 
 def record_chunk() -> np.ndarray:
-    frames = int(SAMPLE_RATE * CHUNK_SECONDS)
-    audio = sd.rec(frames, samplerate=SAMPLE_RATE, channels=CHANNELS, dtype="float32")
-    sd.wait()
-    mono = audio[:, 0] if audio.ndim > 1 else audio
-    return mono
+    frames_total = int(SAMPLE_RATE * CHUNK_SECONDS)
+    read_block = max(1, SAMPLE_RATE // 10)  # 100ms blocks for responsive stop.
+    parts: list[np.ndarray] = []
+
+    with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype="float32") as stream:
+        remaining = frames_total
+        while remaining > 0 and running:
+            take = min(read_block, remaining)
+            frames, _overflowed = stream.read(take)
+            mono = frames[:, 0] if frames.ndim > 1 else frames
+            parts.append(np.asarray(mono, dtype=np.float32))
+            remaining -= take
+
+    if not parts:
+        return np.zeros(0, dtype=np.float32)
+    return np.concatenate(parts, axis=0)
 
 
 def transcribe_chunk(client: OpenAI, wav_path: Path) -> str:
@@ -67,63 +76,12 @@ def append_text_line(transcript_file: Path, text: str):
         f.write(text + "\n")
 
 
-def extract_chunk_features(audio: np.ndarray) -> np.ndarray:
-    # Lightweight voice signature for rough clustering per chunk.
-    x = audio.astype(np.float32)
-    if x.size == 0:
-        return np.zeros(4, dtype=np.float32)
-
-    rms = float(np.sqrt(np.mean(np.square(x))) + 1e-12)
-    zcr = float(np.mean(np.abs(np.diff(np.signbit(x)))))
-
-    spectrum = np.abs(np.fft.rfft(x))
-    freqs = np.fft.rfftfreq(x.size, d=1.0 / SAMPLE_RATE)
-    spec_sum = float(np.sum(spectrum) + 1e-12)
-    centroid = float(np.sum(freqs * spectrum) / spec_sum)
-
-    bandwidth = float(np.sqrt(np.sum(((freqs - centroid) ** 2) * spectrum) / spec_sum))
-
-    return np.array([np.log(rms), zcr, centroid / 4000.0, bandwidth / 4000.0], dtype=np.float32)
-
-
-def assign_speaker(
-    feature: np.ndarray,
-    centroids: list[np.ndarray],
-    counts: list[int],
-    max_speakers: int,
-) -> int:
-    if not centroids:
-        centroids.append(feature.copy())
-        counts.append(1)
-        return 1
-
-    distances = [float(np.linalg.norm(feature - c)) for c in centroids]
-    best_idx = int(np.argmin(distances))
-
-    # Spawn a new speaker if sufficiently different and we still can.
-    if distances[best_idx] > 0.35 and len(centroids) < max_speakers:
-        centroids.append(feature.copy())
-        counts.append(1)
-        return len(centroids)
-
-    n = counts[best_idx]
-    centroids[best_idx] = (centroids[best_idx] * n + feature) / (n + 1)
-    counts[best_idx] = n + 1
-    return best_idx + 1
-
-
-def append_chunk_as_sentences(
-    transcript_file: Path,
-    chunk_text: str,
-    speaker_label: str | None,
-    state: dict,
-):
+def append_chunk_as_sentences(transcript_file: Path, chunk_text: str):
     cleaned = " ".join(chunk_text.split())
 
     # For silent chunks, write a plain blank line as a separator.
     if not cleaned:
         append_text_line(transcript_file, "")
-        state["last_speaker"] = None
         return
 
     spacer = ""
@@ -135,17 +93,7 @@ def append_chunk_as_sentences(
             spacer = " "
 
     with transcript_file.open("a", encoding="utf-8") as f:
-        last_speaker = state.get("last_speaker")
-        if speaker_label and speaker_label != last_speaker:
-            if transcript_file.stat().st_size > 0 and last_char != "\n":
-                f.write("\n")
-            f.write(f"[{speaker_label}] ")
-            spacer = ""
-            state["last_speaker"] = speaker_label
-
         f.write(spacer + cleaned)
-        if cleaned.endswith((".", "!", "?")):
-            f.write("\n")
 
 
 def main():
@@ -161,17 +109,9 @@ def main():
     print("Chunked transcription started. Press Ctrl+C to stop.")
     print(f"Model: {MODEL}")
     print(f"Chunk length: {CHUNK_SECONDS}s")
-    if DIARIZATION_ENABLED:
-        print(f"Diarization: on ({DIARIZATION_SPEAKERS} speakers)")
-    else:
-        print("Diarization: off")
     print(f"Transcript file: {transcript_file}")
 
     idx = 0
-    centroids: list[np.ndarray] = []
-    counts: list[int] = []
-    transcript_state = {"last_speaker": None}
-
     while running:
         idx += 1
         chunk_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -179,23 +119,16 @@ def main():
 
         try:
             audio = record_chunk()
+            if audio.size == 0:
+                append_text_line(transcript_file, "")
+                print("")
+                continue
+
             sf.write(wav_path, audio, SAMPLE_RATE, subtype="PCM_16")
 
             text = transcribe_chunk(client, wav_path)
-            speaker_label = None
-            if DIARIZATION_ENABLED and text.strip():
-                feature = extract_chunk_features(audio)
-                speaker_id = assign_speaker(feature, centroids, counts, DIARIZATION_SPEAKERS)
-                speaker_label = f"Speaker {speaker_id}"
-
-            append_chunk_as_sentences(transcript_file, text, speaker_label, transcript_state)
-            if text:
-                if speaker_label:
-                    print(f"[{speaker_label}] {text}")
-                else:
-                    print(text)
-            else:
-                print("")
+            append_chunk_as_sentences(transcript_file, text)
+            print(text if text else "")
 
             if not SAVE_CHUNKS:
                 try:

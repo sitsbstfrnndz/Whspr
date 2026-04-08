@@ -5,9 +5,10 @@ Simple local realtime transcription toolkit for macOS.
 ## Features
 
 - Realtime microphone transcription via OpenAI Realtime API
+- Chunked microphone transcription via OpenAI Transcriptions API
 - Low-latency streaming output in terminal
-- Automatic transcript persistence to `~/AudioLogs/realtime_transcript.txt`
-- Simple launch scripts that all route to realtime mode
+- Automatic transcript persistence to `~/AudioLogs`
+- Simple UI with `Realtime` and `Chunked` modes
 
 ## Requirements
 
@@ -108,8 +109,6 @@ Optional environment variables used by `chunked_transcribe.py`:
 - `CHUNK_SECONDS` (default: `4`)
 - `CHUNK_SAMPLE_RATE` (default: `16000`)
 - `SAVE_CHUNKS=1` to keep chunk `.wav` files (default: off)
-- `DIARIZATION=1` to enable speaker diarization labels (default: off)
-- `DIARIZATION_SPEAKERS` max speaker clusters (default: `2`)
 - `TRANSCRIPT_DIR` output directory (default: `~/AudioLogs`)
 
 Example with audio saving:
