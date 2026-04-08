@@ -10,6 +10,10 @@ Simple local realtime transcription toolkit for macOS.
 - Automatic transcript persistence to `~/AudioLogs`
 - Simple UI with `Realtime` and `Chunked` modes
 
+## Screenshot
+
+![Whspr Realtime UI](assets/whspr-realtime-ui.png)
+
 ## Requirements
 
 - macOS
